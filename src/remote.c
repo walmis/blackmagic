@@ -25,7 +25,11 @@
 #include "jtagtap.h"
 #include "gdb_if.h"
 #include "version.h"
+#include "exception.h"
 #include <stdarg.h>
+#include "target/adiv5.h"
+#include "target.h"
+#include "hex_utils.h"
 
 
 #define NTOH(x) ((x<=9)?x+'0':'a'+x-10)
@@ -55,6 +59,30 @@ uint64_t remotehston(uint32_t limit, char *s)
 
 	return ret;
 }
+
+static void _send_buf(uint8_t* buffer, size_t len)
+{
+	uint8_t* p = buffer;
+	char hex[2];
+	do {
+		hexify(hex, (const void*)p++, 1);
+
+		gdb_if_putchar(hex[0], 0);
+		gdb_if_putchar(hex[1], 0);
+
+	} while (p<(buffer+len));
+}
+
+static void _respond_buf(char respCode, uint8_t* buffer, size_t len)
+{
+	gdb_if_putchar(REMOTE_RESP, 0);
+	gdb_if_putchar(respCode, 0);
+
+	_send_buf(buffer, len);
+
+	gdb_if_putchar(REMOTE_EOM, 1);
+}
+
 
 static void _respond(char respCode, uint64_t param)
 
@@ -206,6 +234,7 @@ void remotePacketProcessJTAG(uint8_t i, char *packet)
     }
 }
 
+static target* cur_target;
 void remotePacketProcessGEN(uint8_t i, char *packet)
 
 {
@@ -254,6 +283,187 @@ void remotePacketProcessGEN(uint8_t i, char *packet)
     }
 }
 
+void remotePacketProcessHL(uint8_t i, char *packet)
+
+{
+	(void)i;
+	SET_IDLE_STATE(0);
+
+	switch (packet[1]) {
+	case REMOTE_INIT_SWDP: {
+		swdptap_init();
+
+		int devs = -1;
+		volatile struct exception e;
+		TRY_CATCH (e, EXCEPTION_ALL) {
+			devs = adiv5_swdp_scan();
+		}
+		switch (e.type) {
+		case EXCEPTION_TIMEOUT:
+			_respond(REMOTE_RESP_ERR, 0);
+			break;
+		case EXCEPTION_ERROR:
+			_respond(REMOTE_RESP_ERR, 0);
+			break;
+		}
+
+		if(devs <= 0) {
+			_respond(REMOTE_RESP_ERR, 0);
+			break;
+		}
+		cur_target = target_attach_n(1, 0);
+		if(cur_target) {
+			_respond(REMOTE_RESP_OK, 0);
+		} else {
+			_respond(REMOTE_RESP_ERR, 0);
+		}
+
+		break;
+	}
+
+    case REMOTE_MEM_READ:
+    {
+    	uint32_t address;
+    	uint32_t count;
+
+    	packet += 2;
+    	address = remotehston(8, packet);
+    	packet+= 8;
+    	count = remotehston(8, packet);
+    	packet += 8;
+
+    	if(cur_target) {
+    		if(count <= 4) {
+    			uint32_t mem = 0;
+    			if(target_mem_read(cur_target, (void*)&mem, address, count) != 0) {
+    				_respond(REMOTE_RESP_ERR, 0);
+    				break;
+    			} else {
+    				_respond_buf(REMOTE_RESP_OK, (void*)&mem, count);
+    				break;
+    			}
+    		} else {
+    			uint8_t* mem = malloc(count);
+    			if(!mem) {
+    				_respond(REMOTE_RESP_ERR, 0);
+    				break;
+    			} else {
+    				if(target_mem_read(cur_target, (void*)mem, address, count) != 0) {
+    					_respond(REMOTE_RESP_ERR, 0);
+    				} else {
+    					_respond_buf(REMOTE_RESP_OK, (void*)mem, count);
+    				}
+    			}
+    			free(mem);
+    		}
+    	} else {
+    		_respond(REMOTE_RESP_ERR, 0);
+    	}
+		break;
+    }
+
+
+    case REMOTE_MEM_WRITE:
+    {
+    	uint32_t address;
+    	uint32_t count;
+
+    	if(!cur_target) {
+    		_respond(REMOTE_RESP_ERR, 0);
+    		break;
+    	}
+
+    	packet+=2;
+    	address = remotehston(8, packet);
+    	packet+=8;
+    	count = remotehston(8, packet);
+    	packet+=8;
+
+    	if(count <= 4) {
+    		uint32_t val;
+    		unhexify((void*)&val, packet, count);
+    		if(target_mem_write(cur_target, address, (void*)&val, count) != 0) {
+    			_respond(REMOTE_RESP_ERR, 0);
+    		} else {
+    			_respond(REMOTE_RESP_OK, 0);
+    		}
+    	} else {
+    		void* data = malloc(count);
+    		if(!data) {
+    			_respond(REMOTE_RESP_ERR, 0);
+    			break;
+    		}
+    		unhexify(data, packet, count);
+    		if(target_mem_write(cur_target, address, data, count) != 0) {
+    			_respond(REMOTE_RESP_ERR, 0);
+    		} else {
+    			_respond(REMOTE_RESP_OK, 0);
+    		}
+    		free(data);
+    	}
+
+    	break;
+    }
+
+	case REMOTE_REG_READ:
+	{
+    	uint8_t reg;
+
+    	if(!cur_target) {
+    		_respond(REMOTE_RESP_ERR, 0);
+    		break;
+    	}
+
+    	packet+=2;
+    	reg = remotehston(2, packet);
+    	uint32_t val;
+    	target_reg_read(cur_target, reg, (void*)&val, sizeof(val));
+		_respond_buf(REMOTE_RESP_OK, (void*)&val, sizeof(val));
+
+		break;
+	}
+
+	case REMOTE_REG_WRITE:
+	{
+    	uint8_t reg;
+    	uint32_t val;
+
+    	if(!cur_target) {
+    		_respond(REMOTE_RESP_ERR, 0);
+    		break;
+    	}
+
+    	packet+=2;
+    	reg = remotehston(2, packet);
+    	packet+=2;
+    	val = remotehston(8, packet);
+
+    	target_reg_write(cur_target, reg, (void*)&val, sizeof(val));
+		_respond(REMOTE_RESP_OK, 0);
+
+		break;
+	}
+
+	case REMOTE_RESET:
+	{
+		if(!cur_target) {
+			_respond(REMOTE_RESP_ERR, 0);
+		} else {
+			target_reset(cur_target);
+			_respond(REMOTE_RESP_OK, 0);
+		}
+		break;
+	}
+
+    default:
+		_respond(REMOTE_RESP_ERR,REMOTE_ERROR_UNRECOGNISED);
+		break;
+    }
+
+	SET_IDLE_STATE(1);
+}
+
+
 void remotePacketProcess(uint8_t i, char *packet)
 {
 	switch (packet[0]) {
@@ -268,7 +478,11 @@ void remotePacketProcess(uint8_t i, char *packet)
     case REMOTE_GEN_PACKET:
 		remotePacketProcessGEN(i,packet);
 		break;
-
+		
+    case REMOTE_HL_PACKET:
+		remotePacketProcessHL(i,packet);
+		break;
+		
     default: /* Oh dear, unrecognised, return an error */
 		_respond(REMOTE_RESP_ERR,REMOTE_ERROR_UNRECOGNISED);
 		break;

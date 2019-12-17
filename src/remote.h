@@ -83,6 +83,15 @@
 #define REMOTE_RESP_ERR    'E'
 #define REMOTE_RESP_NOTSUP 'N'
 
+/* High level protocol elements */
+#define REMOTE_HL_PACKET 'H'
+#define REMOTE_INIT_SWDP    'S'
+#define REMOTE_REG_READ     'r'
+#define REMOTE_REG_WRITE    'y'
+#define REMOTE_MEM_READ     'm'
+#define REMOTE_MEM_WRITE    'w'
+
+
 /* Generic protocol elements */
 #define REMOTE_GEN_PACKET  'G'
 
